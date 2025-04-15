@@ -17,18 +17,11 @@ from matplotlib.figure import Figure
 # Постоянная Больцмана (в эВ/К)
 k_B = 8.617e-5
 
-# Глобальная переменная для смещения интерактивных окон,
-# чтобы они не открывались в одном и том же месте
+# Глобальная переменная для смещения интерактивных окон
 interactive_counter = 0
 
 
-# ===================== Функции для получения информации о папке =====================
-
 def get_folder_from_longname(longname):
-    """
-    Извлекает путь (директорию) из строки longname с помощью os.path.dirname.
-    Если разделителей нет, возвращает "<Root>".
-    """
     folder = os.path.dirname(longname)
     if not folder or folder.strip() == "":
         folder = "<Root>"
@@ -36,13 +29,6 @@ def get_folder_from_longname(longname):
 
 
 def get_folder_info(origin):
-    """
-    Собирает информацию о книгах (рабочих страницах) Origin‑файла.
-    Для каждой страницы берется book_fullname из page.LongName (если задано) или page.Name.
-    Затем извлекается папка через os.path.dirname (и при необходимости – через get_folder_from_longname).
-    Возвращает словарь вида:
-         { folder_path: [(book_index, base_book_name), ...], ... }
-    """
     folders_info = {}
     total_pages = int(origin.WorksheetPages.Count)
     for i in range(total_pages):
@@ -60,17 +46,7 @@ def get_folder_info(origin):
     return folders_info
 
 
-# ===================== Окно выбора книг и опций =====================
-
 def select_books_and_options(folders_info):
-    """
-    Открывает окно для выбора книг и опций.
-    На окне отображается Treeview, в котором по папкам показаны книги.
-    Есть два чекбокса:
-      – "Process All Books" – если отмечен, выбираются все книги.
-      – "Enable Interactive Exclusion" – включает режим интерактивного исключения точек.
-    Возвращает кортеж: (selected_books, interactive_flag)
-    """
     top = Toplevel(root)
     top.title("Select Books and Options")
     top.geometry("400x350")
@@ -107,7 +83,6 @@ def select_books_and_options(folders_info):
                     if val:
                         selected_books.append(int(val[0]))
         else:
-            # Если выбран родитель – добавляем всех его детей; иначе – сам элемент.
             for item in tree.selection():
                 children = tree.get_children(item)
                 if children:
@@ -129,139 +104,173 @@ def select_books_and_options(folders_info):
             top.interactive if hasattr(top, "interactive") else False)
 
 
-# ===================== Интерактивное редактирование для всех моделей =====================
+def update_axis(ax, x, y, primary_mask, dual_mask, label, dual_enabled):
+    for ln in ax.lines[:]:
+        ln.remove()
+    if dual_enabled:
+        primary_line = None
+        dual_line = None
+        if np.sum(primary_mask) >= 2:
+            reg = linregress(x[primary_mask], y[primary_mask])
+            Ea_primary = reg.slope * k_B
+            x_sorted = np.sort(x[primary_mask])
+            primary_line, = ax.plot(x_sorted, reg.intercept + reg.slope * x_sorted, 'b-',
+                                    label=f"{label} Primary: slope={reg.slope:.3f}, intercept={reg.intercept:.3f}, r²={reg.rvalue ** 2:.3f}, Ea={Ea_primary:.3f} eV")
+            coeff_primary = (reg.slope, reg.intercept, reg.rvalue ** 2)
+        else:
+            ax.set_title(f"{label} Primary: Not enough points")
+            coeff_primary = (None, None, None)
+        if np.sum(dual_mask) >= 2:
+            reg2 = linregress(x[dual_mask], y[dual_mask])
+            Ea_dual = reg2.slope * k_B
+            x_sorted2 = np.sort(x[dual_mask])
+            dual_line, = ax.plot(x_sorted2, reg2.intercept + reg2.slope * x_sorted2, 'r--',
+                                 label=f"{label} Dual: slope={reg2.slope:.3f}, intercept={reg2.intercept:.3f}, r²={reg2.rvalue ** 2:.3f}, Ea={Ea_dual:.3f} eV")
+        else:
+            ax.set_title(f"{label} Dual: Not enough points")
+        return coeff_primary + (primary_line,)
+    else:
+        if np.sum(primary_mask) >= 2:
+            reg = linregress(x[primary_mask], y[primary_mask])
+            Ea = reg.slope * k_B
+            x_sorted = np.sort(x[primary_mask])
+            line, = ax.plot(x_sorted, reg.intercept + reg.slope * x_sorted, 'b-',
+                            label=f"{label}: slope={reg.slope:.3f}, intercept={reg.intercept:.3f}, r²={reg.rvalue ** 2:.3f}, Ea={Ea:.3f} eV")
+            return (reg.slope, reg.intercept, reg.rvalue ** 2, line)
+        else:
+            ax.set_title(f"{label}: Not enough points")
+            return (None, None, None, None)
+
 
 def interactive_edit_all_models(df_reg, longname):
-    """
-    Открывает окно с тремя субплотами – для каждой модели:
-      - Arrhenius: x = 1/T (1/K), y = ln(R)
-      - (1/T)^0.5: x = invT_half, y = ln(R)
-      - (1/T)^0.25: x = invT_quarter, y = ln(R)
-
-    Пользователь может кликать по точкам для их исключения (исключённые точки показываются красным, активные – зелёным).
-    Новая опция "Sync Exclusion Across Graphs" (по умолчанию включена) позволяет синхронизировать исключение
-    точки на всех графиках.
-
-    При каждом клике пересчитывается линия подгонки и обновляется заголовок субплота.
-    По нажатию кнопки "Done" окно закрывается.
-
-    Функция возвращает кортеж из новых коэффициентов:
-      (slope_arr, intercept_arr, r2_arr,
-       slope_half, intercept_half, r2_half,
-       slope_quarter, intercept_quarter, r2_quarter)
-    """
     global interactive_counter
     win = Toplevel(root)
     win.title("Interactive Editing for All Models")
-    # Смещаем окно, чтобы оно не накладывалось на предыдущие интерактивные окна
     x_offset = 100 + interactive_counter * 50
     y_offset = 100 + interactive_counter * 50
     win.geometry(f"+{x_offset}+{y_offset}")
     interactive_counter += 1
 
-    # Чекбокс для синхронизации исключений (по умолчанию включён)
     sync_exclusion_var = BooleanVar(value=True)
     sync_chk = Checkbutton(win, text="Sync Exclusion Across Graphs", variable=sync_exclusion_var)
     sync_chk.pack(pady=5)
 
-    # Создаём фигуру с тремя субплотами
+    dual_trend_var = BooleanVar(value=False)
+    dual_trend_chk = Checkbutton(win, text="Enable Dual Trend Mode", variable=dual_trend_var)
+    dual_trend_chk.pack(pady=5)
+
     fig, axes = plt.subplots(3, 1, figsize=(8, 16))
 
-    # Данные для каждой модели
     x_arr = df_reg["1/T (1/K)"].values
     x_half = df_reg["invT_half"].values
     x_quarter = df_reg["invT_quarter"].values
     y_data = df_reg["ln(R)"].values
     N = len(x_arr)
-    # Создаём маски для каждого графика (изначально все True)
-    mask_arr = np.ones(N, dtype=bool)
-    mask_half = np.ones(N, dtype=bool)
-    mask_quarter = np.ones(N, dtype=bool)
+    # Всегда создаём оба набора масок
+    mask_primary_arr = np.ones(N, dtype=bool)
+    mask_dual_arr = np.zeros(N, dtype=bool)
+    mask_primary_half = np.ones(N, dtype=bool)
+    mask_dual_half = np.zeros(N, dtype=bool)
+    mask_primary_quarter = np.ones(N, dtype=bool)
+    mask_dual_quarter = np.zeros(N, dtype=bool)
 
-    def update_ax(ax, x, y, mask, label):
-        # Удаляем все ранее построенные линии
-        for ln in ax.lines[:]:
-            ln.remove()
-        if np.sum(mask) >= 2:
-            reg = linregress(x[mask], y[mask])
-            slope = reg.slope
-            intercept = reg.intercept
-            r2 = reg.rvalue ** 2
-            x_sorted = np.sort(x[mask])
-            line, = ax.plot(x_sorted, intercept + slope * x_sorted, 'b-', label="Fit")
-            ax.set_title(f"{label}: slope={slope:.3f}, intercept={intercept:.3f}, r²={r2:.3f}")
-            return slope, intercept, r2, line
-        else:
-            ax.set_title(f"{label}: Not enough points")
-            return None, None, None, None
+    # Начальные цвета scatter-плотов в зависимости от состояния dual режима
+    if dual_trend_var.get():
+        colors_arr = ['red' if v else 'green' for v in mask_dual_arr]
+        colors_half = ['red' if v else 'green' for v in mask_dual_half]
+        colors_quarter = ['red' if v else 'green' for v in mask_dual_quarter]
+    else:
+        colors_arr = ['green' if v else 'red' for v in mask_primary_arr]
+        colors_half = ['green' if v else 'red' for v in mask_primary_half]
+        colors_quarter = ['green' if v else 'red' for v in mask_primary_quarter]
 
-    axes[0].clear()
-    sc_arr = axes[0].scatter(x_arr, y_data, c='green', picker=5)
-    slope_arr, intercept_arr, r2_arr, line_arr = update_ax(axes[0], x_arr, y_data, mask_arr, "Arrhenius Model")
+    sc_arr = axes[0].scatter(x_arr, y_data, c=colors_arr, picker=5)
+    sc_half = axes[1].scatter(x_half, y_data, c=colors_half, picker=5)
+    sc_quarter = axes[2].scatter(x_quarter, y_data, c=colors_quarter, picker=5)
 
-    axes[1].clear()
-    sc_half = axes[1].scatter(x_half, y_data, c='green', picker=5)
-    slope_half, intercept_half, r2_half, line_half = update_ax(axes[1], x_half, y_data, mask_half, "(1/T)^0.5 Model")
+    def update_current_axis(ax, x, y, primary_mask, dual_mask, label):
+        return update_axis(ax, x, y, primary_mask, dual_mask, label, dual_trend_var.get())
 
-    axes[2].clear()
-    sc_quarter = axes[2].scatter(x_quarter, y_data, c='green', picker=5)
-    slope_quarter, intercept_quarter, r2_quarter, line_quarter = update_ax(axes[2], x_quarter, y_data, mask_quarter,
-                                                                           "(1/T)^0.25 Model")
+    slope_arr, intercept_arr, r2_arr, primary_line_arr = update_current_axis(axes[0], x_arr, y_data, mask_primary_arr,
+                                                                             mask_dual_arr, "Arrhenius Model")
+    slope_half, intercept_half, r2_half, primary_line_half = update_current_axis(axes[1], x_half, y_data,
+                                                                                 mask_primary_half, mask_dual_half,
+                                                                                 "(1/T)^0.5 Model")
+    slope_quarter, intercept_quarter, r2_quarter, primary_line_quarter = update_current_axis(axes[2], x_quarter, y_data,
+                                                                                             mask_primary_quarter,
+                                                                                             mask_dual_quarter,
+                                                                                             "(1/T)^0.25 Model")
 
     fig.tight_layout()
 
     def onpick(event):
         nonlocal slope_arr, intercept_arr, r2_arr, slope_half, intercept_half, r2_half, slope_quarter, intercept_quarter, r2_quarter
-        # Определяем индекс выбранной точки
         for idx, ax in enumerate(axes):
             if event.artist in ax.collections:
                 ind = event.ind[0]
-                if sync_exclusion_var.get():
-                    # Если синхронизация включена – обновляем все маски для выбранного индекса
-                    new_val = not mask_arr[ind]  # используем mask_arr как эталон
-                    mask_arr[ind] = new_val
-                    mask_half[ind] = new_val
-                    mask_quarter[ind] = new_val
-                    # Обновляем цвета всех scatter-плотов
-                    sc_arr.set_color(['green' if m else 'red' for m in mask_arr])
-                    sc_half.set_color(['green' if m else 'red' for m in mask_half])
-                    sc_quarter.set_color(['green' if m else 'red' for m in mask_quarter])
-                    # Пересчитываем линии подгонки для всех графиков
-                    res0 = update_ax(axes[0], x_arr, y_data, mask_arr, "Arrhenius Model")
-                    res1 = update_ax(axes[1], x_half, y_data, mask_half, "(1/T)^0.5 Model")
-                    res2 = update_ax(axes[2], x_quarter, y_data, mask_quarter, "(1/T)^0.25 Model")
-                    if res0[0] is not None:
-                        slope_arr, intercept_arr, r2_arr, _ = res0
-                    if res1[0] is not None:
-                        slope_half, intercept_half, r2_half, _ = res1
-                    if res2[0] is not None:
-                        slope_quarter, intercept_quarter, r2_quarter, _ = res2
+                if dual_trend_var.get():
+                    if sync_exclusion_var.get():
+                        new_val = not mask_dual_arr[ind]
+                        mask_dual_arr[ind] = new_val
+                        mask_dual_half[ind] = new_val
+                        mask_dual_quarter[ind] = new_val
+                    else:
+                        if idx == 0:
+                            mask_dual_arr[ind] = not mask_dual_arr[ind]
+                        elif idx == 1:
+                            mask_dual_half[ind] = not mask_dual_half[ind]
+                        elif idx == 2:
+                            mask_dual_quarter[ind] = not mask_dual_quarter[ind]
                 else:
-                    # Если синхронизация отключена – обновляем только выбранный график
-                    if idx == 0:
-                        mask_arr[ind] = not mask_arr[ind]
-                        sc_arr.set_color(['green' if m else 'red' for m in mask_arr])
-                        res = update_ax(ax, x_arr, y_data, mask_arr, "Arrhenius Model")
-                        if res[0] is not None:
-                            slope_arr, intercept_arr, r2_arr, _ = res
-                    elif idx == 1:
-                        mask_half[ind] = not mask_half[ind]
-                        sc_half.set_color(['green' if m else 'red' for m in mask_half])
-                        res = update_ax(ax, x_half, y_data, mask_half, "(1/T)^0.5 Model")
-                        if res[0] is not None:
-                            slope_half, intercept_half, r2_half, _ = res
-                    elif idx == 2:
-                        mask_quarter[ind] = not mask_quarter[ind]
-                        sc_quarter.set_color(['green' if m else 'red' for m in mask_quarter])
-                        res = update_ax(ax, x_quarter, y_data, mask_quarter, "(1/T)^0.25 Model")
-                        if res[0] is not None:
-                            slope_quarter, intercept_quarter, r2_quarter, _ = res
+                    if sync_exclusion_var.get():
+                        new_val = not mask_primary_arr[ind]
+                        mask_primary_arr[ind] = new_val
+                        mask_primary_half[ind] = new_val
+                        mask_primary_quarter[ind] = new_val
+                    else:
+                        if idx == 0:
+                            mask_primary_arr[ind] = not mask_primary_arr[ind]
+                        elif idx == 1:
+                            mask_primary_half[ind] = not mask_primary_half[ind]
+                        elif idx == 2:
+                            mask_primary_quarter[ind] = not mask_primary_quarter[ind]
                 break
+
+        if dual_trend_var.get():
+            sc_arr.set_color(['red' if v else 'green' for v in mask_dual_arr])
+            sc_half.set_color(['red' if v else 'green' for v in mask_dual_half])
+            sc_quarter.set_color(['red' if v else 'green' for v in mask_dual_quarter])
+            res0 = update_current_axis(axes[0], x_arr, y_data, mask_primary_arr, mask_dual_arr, "Arrhenius Model")
+            res1 = update_current_axis(axes[1], x_half, y_data, mask_primary_half, mask_dual_half, "(1/T)^0.5 Model")
+            res2 = update_current_axis(axes[2], x_quarter, y_data, mask_primary_quarter, mask_dual_quarter,
+                                       "(1/T)^0.25 Model")
+            if res0[0] is not None:
+                slope_arr, intercept_arr, r2_arr, _ = res0
+            if res1[0] is not None:
+                slope_half, intercept_half, r2_half, _ = res1
+            if res2[0] is not None:
+                slope_quarter, intercept_quarter, r2_quarter, _ = res2
+        else:
+            sc_arr.set_color(['green' if v else 'red' for v in mask_primary_arr])
+            sc_half.set_color(['green' if v else 'red' for v in mask_primary_half])
+            sc_quarter.set_color(['green' if v else 'red' for v in mask_primary_quarter])
+            res0 = update_current_axis(axes[0], x_arr, y_data, mask_primary_arr, None, "Arrhenius Model")
+            res1 = update_current_axis(axes[1], x_half, y_data, mask_primary_half, None, "(1/T)^0.5 Model")
+            res2 = update_current_axis(axes[2], x_quarter, y_data, mask_primary_quarter, None, "(1/T)^0.25 Model")
+            if res0[0] is not None:
+                slope_arr, intercept_arr, r2_arr, _ = res0
+            if res1[0] is not None:
+                slope_half, intercept_half, r2_half, _ = res1
+            if res2[0] is not None:
+                slope_quarter, intercept_quarter, r2_quarter, _ = res2
+
+        # Обновляем легенды для каждого субплота с заголовком longname
+        for ax in axes:
+            ax.legend(title=longname)
         fig.canvas.draw()
 
     fig.canvas.mpl_connect('pick_event', onpick)
 
-    # Устанавливаем легенду для каждого субплота с заголовком longname
     for ax in axes:
         ax.legend(title=longname)
 
@@ -270,19 +279,15 @@ def interactive_edit_all_models(df_reg, longname):
     canvas.get_tk_widget().pack(fill="both", expand=True)
     toolbar = NavigationToolbar2Tk(canvas, win)
     toolbar.update()
-    btn_done = Button(win, text="Done", command=win.destroy)
-    btn_done.pack(pady=10)
+    Button(win, text="Done", command=win.destroy).pack(pady=10)
     win.wait_window()
 
-    # Закрываем фигуру, чтобы избежать последующих накладок
     plt.close(fig)
 
     return (slope_arr, intercept_arr, r2_arr,
             slope_half, intercept_half, r2_half,
             slope_quarter, intercept_quarter, r2_quarter)
 
-
-# ===================== Функция для прямых вычислений регрессии (без интерактива) =====================
 
 def perform_direct_regression(df_reg):
     reg_arr = linregress(df_reg["1/T (1/K)"], df_reg["ln(R)"])
@@ -305,8 +310,6 @@ def perform_direct_regression(df_reg):
             slope_quarter, intercept_quarter, r2_quarter)
 
 
-# ===================== Основная функция обработки файла =====================
-
 def process_file():
     filepath = filedialog.askopenfilename(
         title="Select CSV, TXT or Origin File",
@@ -317,8 +320,6 @@ def process_file():
     ext = os.path.splitext(filepath)[1].lower()
     result_prefix = os.path.splitext(filepath)[0]
     results = []
-    # Словарь для композитных графиков. Теперь каждая запись – кортеж:
-    # (T, Fit, activation_energy, longname)
     composite_data = {"Arrhenius": [], "(1/T)^0.5": [], "(1/T)^0.25": []}
 
     if ext in [".opj", ".opju"]:
@@ -346,7 +347,6 @@ def process_file():
                 showinfo("Error", "No books selected.")
                 return
 
-            # Обрабатываем каждую выбранную книгу
             for book_index in selected_books:
                 page = origin.WorksheetPages(book_index)
                 if page.Layers.Count == 0:
@@ -399,7 +399,6 @@ def process_file():
                 df_reg["invT_half"] = df_reg["1/T (1/K)"] ** 0.5
                 df_reg["invT_quarter"] = df_reg["1/T (1/K)"] ** 0.25
 
-                # Запуск интерактивного режима или прямых вычислений
                 if interactive_flag:
                     (slope_arr, intercept_arr, r2_arr,
                      slope_half, intercept_half, r2_half,
@@ -443,7 +442,6 @@ def process_file():
                     "summary": summary,
                     "longname": book_longname
                 })
-                # Сохраняем композитные данные с дополнениями: (T, Fit, activation_energy, longname)
                 composite_data["Arrhenius"].append(
                     (df_reg["T, K"].values, df_reg["Fit_Arrhenius"].values, activation_energy_arr, book_longname))
                 composite_data["(1/T)^0.5"].append(
@@ -451,7 +449,6 @@ def process_file():
                 composite_data["(1/T)^0.25"].append(
                     (df_reg["T, K"].values, df_reg["Fit_Quarter"].values, activation_energy_quarter, book_longname))
 
-            # Если выбрано более одной книги, строим композитные графики
             if len(selected_books) > 1:
                 comp_win = Toplevel(root)
                 comp_win.title("Composite Fit Charts")
@@ -529,7 +526,6 @@ def process_file():
             showinfo("Error", f"Unable to read file: {e}")
             return
 
-    # ===================== Экспорт результатов в Excel =====================
     excel_output = result_prefix + "_processed.xlsx"
     txt_output = result_prefix + "_processed.txt"
 
@@ -678,7 +674,6 @@ def process_file():
         with open(txt_output, "w", encoding="utf-8") as f:
             f.write(df.to_csv(sep='\t', index=False))
 
-    # ===================== Вывод итоговых неинтерактивных графиков в окне приложения =====================
     graph_window = Toplevel(root)
     graph_window.title("Graphical Results")
     fig = Figure(figsize=(8, 16), dpi=100)
